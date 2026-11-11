@@ -95,7 +95,10 @@ use protocol::{Claim, dot, first_claim};
 mod basis;
 #[cfg(feature = "bench")]
 pub mod batch_bench;
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "pclmulqdq"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_feature = "avx2", target_feature = "pclmulqdq"),
+    all(target_arch = "aarch64", target_feature = "aes")
+))]
 mod clmul;
 mod keccak;
 pub mod kernels;
