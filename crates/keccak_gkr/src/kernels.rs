@@ -34,8 +34,7 @@ cfg_select! {
     _ => {
         mod simd {
             pub use super::{
-                embed_extend_portable as embed_extend, embed_portable as embed, fold_groups_portable as fold_groups,
-                products_portable as products, skip_row_portable as skip_row,
+                embed_portable as embed, fold_groups_portable as fold_groups, products_portable as products,
             };
         }
     }
@@ -53,8 +52,8 @@ pub(crate) const MIXED: usize = TERNARY - GROUP;
 /// The mixed points of a block position's two groups, rounded up to whole vectors.
 pub const SLOTS: usize = (2 * MIXED).next_multiple_of(8);
 
-/// Sums of `value * weight word`, a 128-bit product each, laid out as the vector kernel leaves
-/// them: entry `i` of a run of eight sits at `lane(i)`.
+/// Sums of `value * weight word`, a 128-bit product each: entry `i` of a run of eight sits at
+/// `lane(i)`.
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
 pub struct Lanes(pub(crate) [u128; 4]);
@@ -144,12 +143,7 @@ pub fn extend(packs: &[u32; PACKS], out: &mut [u32; SLOTS]) {
 }
 
 /// [`extend`] of [`embed`].
-#[inline(always)]
 pub fn embed_extend(words: &[u64; BLOCK_WORDS], out: &mut [u32; SLOTS]) {
-    simd::embed_extend(words, out)
-}
-
-pub fn embed_extend_portable(words: &[u64; BLOCK_WORDS], out: &mut [u32; SLOTS]) {
     extend(&embed(words), out)
 }
 
@@ -176,12 +170,7 @@ pub fn products_portable(a: &[u32; PACKS], b: &[u32; PACKS], c: &[u32; PACKS]) -
 
 /// One row of five positions, which `chi` mixes cyclically: for every pattern,
 /// `acc[p] += sum over x of weights[x] * e[x + 1][p] * e[x + 2][p]`.
-#[inline(always)]
 pub fn skip_row(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 3]; 5]) {
-    simd::skip_row(acc, e, weights)
-}
-
-pub fn skip_row_portable(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 3]; 5]) {
     for x in 0..5 {
         let (b, c) = (&e[(x + 1) % 5], &e[(x + 2) % 5]);
         for p in 0..SLOTS {
@@ -244,7 +233,7 @@ fn skip_block_portable(block: &[u64], weights: &[[u64; 3]]) -> Vec<[u128; 3]> {
             for x in 0..5 {
                 extend(&embed_portable(crate::witness::words(block, js[x])), &mut extended[x]);
             }
-            skip_row_portable(&mut acc, &extended, std::array::from_fn(|x| &weights[js[x]]));
+            skip_row(&mut acc, &extended, std::array::from_fn(|x| &weights[js[x]]));
         }
     }
     (0..2 * MIXED).map(|i| acc.get(i)).collect()
@@ -339,8 +328,8 @@ pub fn products_clmul(a: &[u32; PACKS], b: &[u32; PACKS], c: &[u32; PACKS]) -> [
 mod x86 {
     use core::arch::x86_64::*;
 
+    pub use super::products_clmul as products;
     use super::*;
-    pub use super::{embed_extend_portable as embed_extend, products_clmul as products, skip_row_portable as skip_row};
     use crate::keccak::BITS;
 
     /// The matrices sending a pack's low and high byte to each byte of its embedding. An affine
@@ -637,8 +626,8 @@ mod x86 {
 mod avx2 {
     use core::arch::x86_64::*;
 
+    pub use super::products_clmul as products;
     use super::*;
-    pub use super::{embed_extend_portable as embed_extend, products_clmul as products, skip_row_portable as skip_row};
     use crate::clmul::{V, Vector};
 
     /// The 32 packs of a block position, embedded, four to a register.
@@ -722,7 +711,6 @@ mod neon {
     use primitives::field::gf2_64::aarch64::{pmull_hi_asm as mul_hi, pmull_lo_asm as mul_lo};
 
     use super::*;
-    pub use super::{embed_extend_portable as embed_extend, skip_row_portable as skip_row};
 
     /// A linear map is the sum of its nibbles' images, so each byte of sixteen embeddings is four
     /// table lookups.
@@ -1035,25 +1023,6 @@ mod tests {
                 embed(&std::array::from_fn(|_| rng.next_u64())),
             );
             assert_eq!(products(&e, &b, &c), products_portable(&e, &b, &c));
-
-            let (mut xe, mut xp) = ([0u32; SLOTS], [0u32; SLOTS]);
-            embed_extend(&words, &mut xe);
-            extend(&embed_portable(&words), &mut xp);
-            assert_eq!(xe[..2 * MIXED], xp[..2 * MIXED]);
-            let (mut xb, mut xc) = ([0u32; SLOTS], [0u32; SLOTS]);
-            extend(&b, &mut xb);
-            extend(&c, &mut xc);
-            let (mut fast, mut slow) = (SkipAcc::new(), SkipAcc::new());
-            let row = [xb, xc, xb, xc, xb];
-            let weights: [[u64; 3]; 2] = std::array::from_fn(|_| std::array::from_fn(|_| rng.next_u64()));
-            let row_weights = [&weights[0], &weights[1], &weights[0], &weights[1], &weights[0]];
-            for _ in 0..2 {
-                skip_row(&mut fast, &row, row_weights);
-                skip_row_portable(&mut slow, &row, row_weights);
-            }
-            for slot in 0..SLOTS {
-                assert_eq!(fast.get(slot), slow.get(slot));
-            }
             let fold: [[u64; GROUP]; 3] = std::array::from_fn(|_| std::array::from_fn(|_| rng.next_u64()));
             assert_eq!(fold_groups(&e, &fold), fold_groups_portable(&e, &fold));
         }
