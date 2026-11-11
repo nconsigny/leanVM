@@ -260,6 +260,9 @@ cfg_select! {
     ) => {
         pub(crate) use x86::SkipBlock;
     }
+    all(target_arch = "x86_64", target_feature = "avx2", target_feature = "pclmulqdq") => {
+        pub(crate) use sliced::SkipBlock;
+    }
     _ => {
         /// [`skip_row`] over every row and slice of a block, a position at a time.
         pub(crate) struct SkipBlock {
@@ -631,8 +634,8 @@ mod x86 {
 mod avx2 {
     use core::arch::x86_64::*;
 
-    pub use super::products_clmul as products;
     use super::*;
+    pub use super::{embed_extend_portable as embed_extend, products_clmul as products, skip_row_portable as skip_row};
     use crate::clmul::{V, Vector};
 
     /// The 32 packs of a block position, embedded, four to a register.
@@ -686,96 +689,6 @@ mod avx2 {
             unsafe { _mm_storeu_si128(out.as_mut_ptr().add(4 * i).cast(), v) };
         }
         out
-    }
-
-    /// NEON's [`extend_group`] on the four vectors of a group: a vector's low mixed points are
-    /// two shuffles, and its lane sum is returned for the last one, which [`embed_extend`] stores
-    /// with the other group's.
-    #[inline(always)]
-    unsafe fn extend_vectors(v: &[__m128i], out: *mut u32) -> __m128i {
-        unsafe {
-            let (w4, w5) = (_mm_xor_si128(v[0], v[1]), _mm_xor_si128(v[2], v[3]));
-            let w = [
-                v[0],
-                v[1],
-                v[2],
-                v[3],
-                w4,
-                w5,
-                _mm_xor_si128(v[0], v[2]),
-                _mm_xor_si128(v[1], v[3]),
-                _mm_xor_si128(w4, w5),
-            ];
-            for (k, &w) in w[4..].iter().enumerate() {
-                _mm_storeu_si128(out.add(4 * k).cast(), w);
-            }
-            // Lanes `0 + 1, 2 + 3, 0 + 2, 1 + 3`.
-            let low: [__m128i; 9] = std::array::from_fn(|k| {
-                _mm_xor_si128(
-                    _mm_shuffle_epi32::<0b01_00_10_00>(w[k]),
-                    _mm_shuffle_epi32::<0b11_10_11_01>(w[k]),
-                )
-            });
-            for (k, &l) in low.iter().enumerate() {
-                _mm_storeu_si128(out.add(20 + 4 * k).cast(), l);
-            }
-            // Lanes 0 and 1 of a vector's low mixed points add to its lane sum: two vectors at a time.
-            let pair = |a: __m128i, b: __m128i| {
-                let z = _mm_unpacklo_epi32(a, b);
-                _mm_xor_si128(z, _mm_unpackhi_epi64(z, z))
-            };
-            for k in (0..8).step_by(4) {
-                let (p, q) = (pair(low[k], low[k + 1]), pair(low[k + 2], low[k + 3]));
-                _mm_storeu_si128(out.add(56 + k).cast(), _mm_unpacklo_epi64(p, q));
-            }
-            low[8]
-        }
-    }
-
-    #[inline(always)]
-    pub fn embed_extend(words: &[u64; BLOCK_WORDS], out: &mut [u32; SLOTS]) {
-        let e = embed_vectors(words);
-        // SAFETY: each group's outputs lie in `out`.
-        unsafe {
-            let last0 = extend_vectors(&e[..4], out.as_mut_ptr());
-            let last1 = extend_vectors(&e[4..], out.as_mut_ptr().add(64));
-            let z = _mm_unpacklo_epi32(last0, last1);
-            _mm_storel_epi64(
-                out.as_mut_ptr().add(128).cast(),
-                _mm_xor_si128(z, _mm_unpackhi_epi64(z, z)),
-            );
-        }
-    }
-
-    /// `2 * N` slots at a time, their sums over the row kept in registers. A slot's product lies
-    /// in the low word of its lane, which multiplies the weights as it is. The padding slots past
-    /// the last whole register are skipped: nothing reads their sums.
-    #[inline(always)]
-    pub fn skip_row(acc: &mut SkipAcc, e: &[[u32; SLOTS]; 5], weights: [&[u64; 3]; 5]) {
-        let w: [[V; 3]; 5] = std::array::from_fn(|x| std::array::from_fn(|k| V::splat(weights[x][k])));
-        for p in (0..2 * MIXED).step_by(2 * V::N) {
-            // SAFETY: `p + 2 * N` is at most `SLOTS`.
-            let z: [V; 5] = std::array::from_fn(|x| unsafe { V::load_packs(e[x].as_ptr().add(p)) });
-            let mut sums = [[V::zero(); 2]; 3];
-            for x in 0..5 {
-                let (zb, zc) = (z[(x + 1) % 5], z[(x + 2) % 5]);
-                let products = [zb.clmul::<0x00>(zc), zb.clmul::<0x11>(zc)];
-                for (k, sums) in sums.iter_mut().enumerate() {
-                    for (sum, product) in sums.iter_mut().zip(products) {
-                        *sum = sum.xor(product.clmul::<0x00>(w[x][k]));
-                    }
-                }
-            }
-            // Slot `p + h + 2 * l` is lane `l` of `sums[.][h]`, and those lanes lie side by side.
-            for (acc, sums) in acc.0.iter_mut().zip(sums) {
-                for (h, sum) in sums.into_iter().enumerate() {
-                    let (v, l) = lane(p + h);
-                    let slot = acc[v].0[l..].as_mut_ptr().cast::<u64>();
-                    // SAFETY: `N` lanes from `l`, a multiple of `N`.
-                    unsafe { V::store(slot, V::load(slot).xor(sum)) };
-                }
-            }
-        }
     }
 
     #[inline(always)]
@@ -991,9 +904,195 @@ mod neon {
     }
 }
 
+/// [`SkipBlock`] on registers of [`Vector`](crate::clmul::Vector) lanes, at any width: each
+/// register holds one value of `L` slices, so the extension is a sum of registers and a slot's
+/// products are a register's lanes, weighted by `L` positions' weights at once.
+///
+/// A row's sum `sum over x of w[x] e[x + 1] e[x + 2]` is taken as
+/// `e[2] (w[0] e[1] + w[1] e[3]) + e[4] (w[2] e[3] + w[3] e[0]) + w[4] (e[0] e[1])`: the two
+/// stars are linear in the values, so they are multiplied out on the group's packs and extended
+/// like them. A slice then takes 12 carry-less products at each mixed point, where the five terms
+/// took 20, and 12 at each pack: 1,944 a row, not 2,600.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "pclmulqdq",
+    not(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "vpclmulqdq",
+        target_feature = "gfni"
+    ))
+))]
+mod sliced {
+    use super::*;
+    use crate::clmul::{V, Vector};
+
+    /// Slices to a register, a word each.
+    const L: usize = 2 * V::N;
+
+    /// [`extend_group`] of each of `F` groups of values on registers, an output at a time: `add(i,
+    /// values)` for every output `i`, walking the high two variables' points as [`HIGH`] orders
+    /// them so that only one point's values are live.
+    #[inline(always)]
+    fn for_each_mixed<const F: usize>(v: [&[V; GROUP]; F], mut add: impl FnMut(usize, [V; F])) {
+        // The four values at a binary high point, and at the point two points sum to.
+        let at = |k: usize| -> [[V; 4]; F] { std::array::from_fn(|f| std::array::from_fn(|l| v[f][4 * k + l])) };
+        let sum = |a: [[V; 4]; F], b: [[V; 4]; F]| -> [[V; 4]; F] {
+            std::array::from_fn(|f| std::array::from_fn(|l| a[f][l].xor(b[f][l])))
+        };
+        for k in 0..HIGH.len() {
+            let g = match k {
+                0..4 => at(k),
+                4 => sum(at(0), at(1)),
+                5 => sum(at(2), at(3)),
+                6 => sum(at(0), at(2)),
+                7 => sum(at(1), at(3)),
+                _ => sum(sum(at(0), at(1)), sum(at(2), at(3))),
+            };
+            if k >= 4 {
+                for l in 0..4 {
+                    add(4 * (k - 4) + l, std::array::from_fn(|f| g[f][l]));
+                }
+            }
+            let low: [[V; 4]; F] = std::array::from_fn(|f| {
+                let g = &g[f];
+                [g[0].xor(g[1]), g[2].xor(g[3]), g[0].xor(g[2]), g[1].xor(g[3])]
+            });
+            for m in 0..4 {
+                add(20 + 4 * k + m, std::array::from_fn(|f| low[f][m]));
+            }
+            add(56 + k, std::array::from_fn(|f| low[f][0].xor(low[f][1])));
+        }
+    }
+
+    /// A star, the factor two of a row's weighted products share: `wa * a + wb * b` on `L`
+    /// slices' values, a register per word.
+    #[inline(always)]
+    fn star(a: V, wa: &[V; 3], b: V, wb: &[V; 3]) -> [V; 4] {
+        let parts: [[V; 2]; 3] = std::array::from_fn(|k| {
+            [
+                a.clmul::<0x00>(wa[k]).xor(b.clmul::<0x00>(wb[k])),
+                a.clmul::<0x11>(wa[k]).xor(b.clmul::<0x11>(wb[k])),
+            ]
+        });
+        // The even and odd slices' products interleave back to a word per slice.
+        let low = |k: usize| parts[k][0].unpacklo(parts[k][1]);
+        let high = |k: usize| parts[k][0].high().unpacklo(parts[k][1].high());
+        [low(0), high(0).xor(low(1)), high(1).xor(low(2)), high(2)]
+    }
+
+    pub struct SkipBlock {
+        /// Per slot, the sums of the products at each word offset.
+        acc: [[V; 4]; 2 * MIXED],
+        /// Per position of a row, its packs on `L` slices, a word each.
+        packs: [[[u64; L]; PACKS]; 5],
+        /// Per position of a row, its weights on `L` slices, by word.
+        weights: [[[u64; L]; 3]; 5],
+        /// Per star and word, its values on the group's packs.
+        stars: [[[V; GROUP]; 4]; 2],
+        /// Per output of the extension, the stars' factors `e[2]` and `e[4]`.
+        factors: [[V; 2]; MIXED],
+    }
+
+    impl SkipBlock {
+        pub fn new() -> Box<Self> {
+            Box::new(Self {
+                acc: [[V::zero(); 4]; 2 * MIXED],
+                packs: [[[0; L]; PACKS]; 5],
+                weights: [[[0; L]; 3]; 5],
+                stars: [[[V::zero(); GROUP]; 4]; 2],
+                factors: [[V::zero(); 2]; MIXED],
+            })
+        }
+
+        /// Sum a block, the position weights as elements.
+        pub fn run(&mut self, block: &[u64], weights: &[[u64; 3]]) {
+            self.acc = [[V::zero(); 4]; 2 * MIXED];
+            for r in 0..5 {
+                for z in (0..64).step_by(L) {
+                    for s in 0..L {
+                        let js = row_positions(r, z + s);
+                        for (x, &j) in js.iter().enumerate() {
+                            let e = embed(crate::witness::words(block, j));
+                            for (packs, e) in self.packs[x].iter_mut().zip(e) {
+                                packs[s] = e.into();
+                            }
+                            for (w, &weight) in self.weights[x].iter_mut().zip(&weights[j]) {
+                                w[s] = weight;
+                            }
+                        }
+                    }
+                    // SAFETY: the module is compiled only where `V`'s features are, and each load
+                    // is of an array of `L` words.
+                    let w = self.weights.map(|w| w.map(|w| unsafe { V::load(w.as_ptr()) }));
+                    for half in 0..2 {
+                        self.run_group(half, &w);
+                    }
+                }
+            }
+        }
+
+        /// One group of the packs [`Self::run`] staged, at the row's weights `w`.
+        #[inline(always)]
+        fn run_group(&mut self, half: usize, w: &[[V; 3]; 5]) {
+            let Self {
+                acc,
+                packs,
+                stars,
+                factors,
+                ..
+            } = self;
+            // SAFETY: the module is compiled only where `V`'s features are, and each load is of
+            // an array of `L` words.
+            let e: [[V; GROUP]; 5] = std::array::from_fn(|x| {
+                std::array::from_fn(|q| unsafe { V::load(packs[x][GROUP * half + q].as_ptr()) })
+            });
+            for q in 0..GROUP {
+                let words = [
+                    star(e[1][q], &w[0], e[3][q], &w[1]),
+                    star(e[3][q], &w[2], e[0][q], &w[3]),
+                ];
+                for (star, words) in stars.iter_mut().zip(words) {
+                    for (star, word) in star.iter_mut().zip(words) {
+                        star[q] = word;
+                    }
+                }
+            }
+            // The values' walk keeps the stars' factors and sums the lone term, of three words.
+            for_each_mixed([&e[0], &e[1], &e[2], &e[4]], |i, [e0, e1, e2, e4]| {
+                factors[i] = [e2, e4];
+                let products = e0.clmul::<0x00>(e1).unpacklo(e0.clmul::<0x11>(e1));
+                for (acc, &w) in acc[slot(half, i)].iter_mut().zip(&w[4]) {
+                    *acc = acc.xor(products.clmul::<0x00>(w)).xor(products.clmul::<0x11>(w));
+                }
+            });
+            for k in 0..4 {
+                for_each_mixed([&stars[0][k], &stars[1][k]], |i, [a, b]| {
+                    let [e2, e4] = factors[i];
+                    let acc = &mut acc[slot(half, i)][k];
+                    *acc = acc
+                        .xor(e2.clmul::<0x00>(a))
+                        .xor(e2.clmul::<0x11>(a))
+                        .xor(e4.clmul::<0x00>(b).xor(e4.clmul::<0x11>(b)));
+                });
+            }
+        }
+
+        /// The three partial products of slot `i`. The sum at the fourth word offset is of an
+        /// embedding by a star's top word, under 64 bits, so it joins the third's high word.
+        pub fn get(&self, i: usize) -> [u128; 3] {
+            let sums = self.acc[i].map(V::sum);
+            debug_assert_eq!(sums[3] >> 64, 0, "a product of at most 240 bits");
+            [sums[0], sums[1], sums[2] ^ (sums[3] << 64)]
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::basis::carry;
     use crate::keccak::BITS;
     use primitives::test_rng::Rng;
 
@@ -1053,13 +1152,18 @@ mod tests {
             let fold: [[u64; GROUP]; 3] = std::array::from_fn(|_| std::array::from_fn(|_| rng.next_u64()));
             assert_eq!(fold_groups(&e, &fold), fold_groups_portable(&e, &fold));
         }
-        let block: Vec<u64> = (0..crate::witness::BLOCK_LEN).map(|_| rng.next_u64()).collect();
-        let weights: Vec<[u64; 3]> = (0..BITS).map(|_| std::array::from_fn(|_| rng.next_u64())).collect();
+        // The kernels keep different partial products of one polynomial. Weights of all ones fill
+        // its every word, and the second run starts over the first's sums.
         let mut skip = SkipBlock::new();
-        skip.run(&block, &weights);
-        let expected = skip_block_portable(&block, &weights);
-        for (i, expected) in expected.iter().enumerate() {
-            assert_eq!(&skip.get(i), expected, "slot {i}");
+        for ones in [false, true] {
+            let block: Vec<u64> = (0..crate::witness::BLOCK_LEN).map(|_| rng.next_u64()).collect();
+            let weights: Vec<[u64; 3]> = (0..BITS)
+                .map(|_| std::array::from_fn(|_| if ones { u64::MAX } else { rng.next_u64() }))
+                .collect();
+            skip.run(&block, &weights);
+            for (i, expected) in skip_block_portable(&block, &weights).iter().enumerate() {
+                assert_eq!(carry::<3, 4>(&skip.get(i)), carry::<3, 4>(expected), "slot {i}");
+            }
         }
     }
 }
