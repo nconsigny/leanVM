@@ -1167,12 +1167,14 @@ def batch_sumcheck(fs0, fs1, fs2, fs3, fs4, msgs, running, point, n_rounds: Cons
 def verify_merkle_cap(cap, flags, depth: Const):
     # Unrolled over the cap's nodes, so every address is an immediate. Every node's
     # hinted digest (node k at heap cells 2k, 2k+1) is read once into a frame run,
-    # node k at cells 2(k - 1) and 2k - 1, where an internal node's hash writes its
-    # digest, landing on (and so asserting) the hinted value. An active (flagged)
-    # node is hashed; an inactive one pins its children's flags to zero, so every
-    # active node's parent is active too, up to the root, which is always hashed.
-    # The queries flag the parents of the cap leaves they reach. The run is sized
-    # per depth, the cap depths a configuration reaches.
+    # node k at cells 2(k - 1) and 2k - 1. An internal node is hashed into its run
+    # first, children before parents, and the copy then lands on (and so asserts)
+    # the hinted value: the hash's second digest cell is then its cell's first
+    # access, which spares the prover a pass over the run's trace. An active
+    # (flagged) node is hashed; an inactive one pins its children's flags to zero,
+    # so every active node's parent is active too, up to the root, which is always
+    # hashed. The queries flag the parents of the cap leaves they reach. The run is
+    # sized per depth, the cap depths a configuration reaches.
     if depth != 0:
         n_leaves = 2 ** depth
         if const(depth == 4):
@@ -1185,11 +1187,12 @@ def verify_merkle_cap(cap, flags, depth: Const):
             runs = StackBuf(4 * 128 - 2)
         else:
             runs = StackBuf(4 * 256 - 2)
-        for node in unroll(1, 2 * n_leaves):
+        for node in unroll(n_leaves, 2 * n_leaves):
             at = 2 * (node - 1)
             runs[at] = cap[GEN ** (2 * node)]
             runs[at + 1] = cap[GEN ** (2 * node + 1)]
-        for node in unroll(1, n_leaves):
+        for i in unroll(1, n_leaves):
+            node = n_leaves - i
             left = 2 * (2 * node - 1)
             right = left + 2
             at = 2 * (node - 1)
@@ -1202,6 +1205,8 @@ def verify_merkle_cap(cap, flags, depth: Const):
                     if const(2 * node // n_leaves == 0):  # node has flagged children
                         flags[GEN ** (2 * node)] = 0
                         flags[GEN ** (2 * node + 1)] = 0
+            runs[at] = cap[GEN ** (2 * node)]
+            runs[at + 1] = cap[GEN ** (2 * node + 1)]
         root_0 = runs[0]
         root_1 = runs[1]
     else:
